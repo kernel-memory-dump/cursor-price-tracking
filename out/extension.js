@@ -4,6 +4,355 @@ exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = require("vscode");
 const https = require("https");
+const fs = require("fs");
+const path = require("path");
+class CostTrackingLogger {
+    constructor() {
+        this.trackingDir = null;
+        this.loggedTimestamps = new Set();
+        this.sessionStartMs = null;
+        this.lastKnownEvents = [];
+        this.trackingState = null;
+        this.initTrackingDir();
+        this.loadSessionState();
+    }
+    initTrackingDir() {
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        if (!workspaceFolder) {
+            return;
+        }
+        this.trackingDir = path.join(workspaceFolder.uri.fsPath, CostTrackingLogger.DIR_NAME);
+    }
+    ensureDirectory() {
+        if (!this.trackingDir) {
+            this.initTrackingDir();
+        }
+        if (!this.trackingDir) {
+            return false;
+        }
+        if (!fs.existsSync(this.trackingDir)) {
+            fs.mkdirSync(this.trackingDir, { recursive: true });
+        }
+        return true;
+    }
+    get summaryPath() {
+        return path.join(this.trackingDir, CostTrackingLogger.SUMMARY_FILE);
+    }
+    get logPath() {
+        return path.join(this.trackingDir, CostTrackingLogger.LOG_FILE);
+    }
+    get trackingStatePath() {
+        return path.join(this.trackingDir, CostTrackingLogger.TRACKING_STATE_FILE);
+    }
+    loadExistingTimestamps() {
+        if (!this.trackingDir || !fs.existsSync(this.logPath)) {
+            return;
+        }
+        try {
+            const content = fs.readFileSync(this.logPath, 'utf-8');
+            const timestampRegex = /^ts=(\d+)/gm;
+            let match;
+            while ((match = timestampRegex.exec(content)) !== null) {
+                this.loggedTimestamps.add(match[1]);
+            }
+        }
+        catch {
+            // If the log can't be read, start fresh tracking
+        }
+    }
+    loadTrackingState() {
+        if (!this.trackingDir) {
+            return;
+        }
+        try {
+            if (fs.existsSync(this.trackingStatePath)) {
+                this.trackingState = JSON.parse(fs.readFileSync(this.trackingStatePath, 'utf-8'));
+            }
+            else if (fs.existsSync(this.logPath)) {
+                this.rebuildTrackingState();
+            }
+        }
+        catch {
+            this.trackingState = null;
+        }
+    }
+    saveTrackingState() {
+        if (!this.trackingDir || !this.trackingState) {
+            return;
+        }
+        fs.writeFileSync(this.trackingStatePath, JSON.stringify(this.trackingState, null, 2), 'utf-8');
+    }
+    incrementTrackingState(newEvents) {
+        if (newEvents.length === 0) {
+            return;
+        }
+        if (!this.trackingState) {
+            const earliest = newEvents.reduce((min, e) => parseInt(e.timestamp) < parseInt(min.timestamp) ? e : min, newEvents[0]);
+            this.trackingState = {
+                firstTrackedAt: new Date(parseInt(earliest.timestamp)).toISOString(),
+                totalRequests: 0,
+                totalTokens: 0,
+                totalCost: 0,
+                byModel: {},
+                byKind: {}
+            };
+        }
+        for (const event of newEvents) {
+            this.trackingState.totalRequests++;
+            this.trackingState.totalTokens += event.tokens;
+            this.trackingState.totalCost += event.cost;
+            const model = event.model || 'Unknown';
+            if (!this.trackingState.byModel[model]) {
+                this.trackingState.byModel[model] = { requests: 0, tokens: 0, cost: 0 };
+            }
+            this.trackingState.byModel[model].requests++;
+            this.trackingState.byModel[model].tokens += event.tokens;
+            this.trackingState.byModel[model].cost += event.cost;
+            const kind = event.kind || 'Unknown';
+            if (!this.trackingState.byKind[kind]) {
+                this.trackingState.byKind[kind] = { requests: 0, tokens: 0, cost: 0 };
+            }
+            this.trackingState.byKind[kind].requests++;
+            this.trackingState.byKind[kind].tokens += event.tokens;
+            this.trackingState.byKind[kind].cost += event.cost;
+        }
+        this.trackingState.totalCost = parseFloat(this.trackingState.totalCost.toFixed(6));
+        for (const entry of Object.values(this.trackingState.byModel)) {
+            entry.cost = parseFloat(entry.cost.toFixed(6));
+        }
+        for (const entry of Object.values(this.trackingState.byKind)) {
+            entry.cost = parseFloat(entry.cost.toFixed(6));
+        }
+        this.saveTrackingState();
+    }
+    rebuildTrackingState() {
+        if (!this.trackingDir || !fs.existsSync(this.logPath)) {
+            return;
+        }
+        const content = fs.readFileSync(this.logPath, 'utf-8');
+        const lines = content.trim().split('\n').filter(l => l.length > 0);
+        if (lines.length === 0) {
+            return;
+        }
+        const lineRegex = /^ts=(\d+) \[([^\]]+)\] Model: ([^|]+)\| Tokens: ([^|]+)\| Cost: ([^|]+)\| Kind: (.+)$/;
+        this.trackingState = null;
+        const parsed = [];
+        for (const line of lines) {
+            const match = lineRegex.exec(line);
+            if (!match) {
+                continue;
+            }
+            const timestamp = match[1];
+            const model = match[3].trim();
+            const tokensStr = match[4].trim().replace(/,/g, '');
+            const costStr = match[5].trim().replace(/[$,]/g, '');
+            const kind = match[6].trim();
+            const tokens = parseInt(tokensStr) || 0;
+            const cost = parseFloat(costStr) || 0;
+            parsed.push({
+                timestamp,
+                date: '',
+                time: '',
+                model,
+                tokens,
+                cost,
+                costDisplay: match[5].trim(),
+                kind
+            });
+        }
+        if (parsed.length > 0) {
+            this.incrementTrackingState(parsed);
+        }
+    }
+    async logUsageEvents(events) {
+        if (events.length === 0) {
+            return;
+        }
+        if (!this.ensureDirectory()) {
+            return;
+        }
+        try {
+            if (this.loggedTimestamps.size === 0) {
+                this.loadExistingTimestamps();
+            }
+            if (!this.trackingState) {
+                this.loadTrackingState();
+            }
+            this.appendToRequestLog(events);
+            this.updateSummaryFile(events);
+        }
+        catch (error) {
+            console.error('CostTrackingLogger: Failed to write tracking data', error);
+        }
+    }
+    updateSummaryFile(events) {
+        this.lastKnownEvents = events;
+        const last24h = { totalRequests: 0, totalTokens: 0, totalCost: 0, totalCostDisplay: '$0.00' };
+        const byModel = {};
+        const byKind = {};
+        for (const event of events) {
+            last24h.totalRequests++;
+            last24h.totalTokens += event.tokens;
+            last24h.totalCost += event.cost;
+            const model = event.model || 'Unknown';
+            if (!byModel[model]) {
+                byModel[model] = { requests: 0, tokens: 0, cost: 0 };
+            }
+            byModel[model].requests++;
+            byModel[model].tokens += event.tokens;
+            byModel[model].cost += event.cost;
+            const kind = event.kind || 'Unknown';
+            if (!byKind[kind]) {
+                byKind[kind] = { requests: 0, tokens: 0, cost: 0 };
+            }
+            byKind[kind].requests++;
+            byKind[kind].tokens += event.tokens;
+            byKind[kind].cost += event.cost;
+        }
+        last24h.totalCostDisplay = `$${last24h.totalCost.toFixed(4)}`;
+        for (const entry of Object.values(byModel)) {
+            entry.cost = parseFloat(entry.cost.toFixed(6));
+        }
+        for (const entry of Object.values(byKind)) {
+            entry.cost = parseFloat(entry.cost.toFixed(6));
+        }
+        const sorted = [...events].sort((a, b) => parseInt(b.timestamp) - parseInt(a.timestamp));
+        const summary = {
+            lastUpdated: new Date().toISOString(),
+            last24h,
+            sinceTrackingStarted: this.trackingState ? {
+                firstTrackedAt: this.trackingState.firstTrackedAt,
+                totalRequests: this.trackingState.totalRequests,
+                totalTokens: this.trackingState.totalTokens,
+                totalCost: this.trackingState.totalCost,
+                totalCostDisplay: `$${this.trackingState.totalCost.toFixed(4)}`
+            } : null,
+            byModel,
+            byKind,
+            recentEvents: sorted.slice(0, 20),
+            activeSession: null
+        };
+        if (this.sessionStartMs) {
+            const sessionEvents = events.filter(e => parseInt(e.timestamp) >= this.sessionStartMs);
+            summary.activeSession = this.buildSessionSummary(sessionEvents);
+        }
+        fs.writeFileSync(this.summaryPath, JSON.stringify(summary, null, 2), 'utf-8');
+    }
+    appendToRequestLog(events) {
+        const sorted = [...events].sort((a, b) => parseInt(a.timestamp) - parseInt(b.timestamp));
+        const newLines = [];
+        const newEvents = [];
+        for (const event of sorted) {
+            if (this.loggedTimestamps.has(event.timestamp)) {
+                continue;
+            }
+            this.loggedTimestamps.add(event.timestamp);
+            newEvents.push(event);
+            const isoTime = new Date(parseInt(event.timestamp)).toISOString();
+            const line = `ts=${event.timestamp} [${isoTime}] Model: ${event.model} | Tokens: ${event.tokens.toLocaleString()} | Cost: ${event.costDisplay} | Kind: ${event.kind}`;
+            newLines.push(line);
+        }
+        if (newLines.length > 0) {
+            const payload = newLines.join('\n') + '\n';
+            fs.appendFileSync(this.logPath, payload, 'utf-8');
+        }
+        this.incrementTrackingState(newEvents);
+    }
+    loadSessionState() {
+        if (!this.trackingDir) {
+            return;
+        }
+        try {
+            const summaryFile = path.join(this.trackingDir, CostTrackingLogger.SUMMARY_FILE);
+            if (fs.existsSync(summaryFile)) {
+                const data = JSON.parse(fs.readFileSync(summaryFile, 'utf-8'));
+                if (data.activeSession?.active) {
+                    this.sessionStartMs = data.activeSession.startedAtMs;
+                }
+            }
+        }
+        catch {
+            // corrupt file — ignore
+        }
+    }
+    startSession() {
+        this.sessionStartMs = Date.now();
+        const iso = new Date(this.sessionStartMs).toISOString();
+        if (this.ensureDirectory() && this.lastKnownEvents.length > 0) {
+            this.updateSummaryFile(this.lastKnownEvents);
+        }
+        vscode.window.showInformationMessage(`Session started at ${iso}`);
+        return iso;
+    }
+    stopSession() {
+        if (!this.sessionStartMs) {
+            vscode.window.showWarningMessage('No active session to stop.');
+            return null;
+        }
+        if (!this.ensureDirectory()) {
+            return null;
+        }
+        const sessionEvents = this.lastKnownEvents.filter(e => parseInt(e.timestamp) >= this.sessionStartMs);
+        const sessionSummary = this.buildSessionSummary(sessionEvents);
+        sessionSummary.active = false;
+        const startIso = new Date(this.sessionStartMs).toISOString();
+        const safeName = startIso.replace(/:/g, '-').replace(/\./g, '-');
+        const filename = `session-${safeName}.json`;
+        const filePath = path.join(this.trackingDir, filename);
+        fs.writeFileSync(filePath, JSON.stringify(sessionSummary, null, 2), 'utf-8');
+        this.sessionStartMs = null;
+        if (this.lastKnownEvents.length > 0) {
+            this.updateSummaryFile(this.lastKnownEvents);
+        }
+        vscode.window.showInformationMessage(`Session saved: ${filename}`);
+        return filePath;
+    }
+    isSessionActive() {
+        return this.sessionStartMs !== null;
+    }
+    buildSessionSummary(events) {
+        const now = Date.now();
+        const durationMs = now - this.sessionStartMs;
+        const minutes = Math.floor(durationMs / 60000);
+        const hours = Math.floor(minutes / 60);
+        const remainingMinutes = minutes % 60;
+        const durationStr = hours > 0 ? `${hours}h ${remainingMinutes}m` : `${remainingMinutes}m`;
+        const summary = {
+            active: true,
+            startedAt: new Date(this.sessionStartMs).toISOString(),
+            startedAtMs: this.sessionStartMs,
+            duration: durationStr,
+            summary: { totalRequests: 0, totalTokens: 0, totalCost: 0, totalCostDisplay: '$0.00' },
+            byModel: {},
+            events: []
+        };
+        for (const event of events) {
+            summary.summary.totalRequests++;
+            summary.summary.totalTokens += event.tokens;
+            summary.summary.totalCost += event.cost;
+            const model = event.model || 'Unknown';
+            if (!summary.byModel[model]) {
+                summary.byModel[model] = { requests: 0, tokens: 0, cost: 0 };
+            }
+            summary.byModel[model].requests++;
+            summary.byModel[model].tokens += event.tokens;
+            summary.byModel[model].cost += event.cost;
+        }
+        summary.summary.totalCostDisplay = `$${summary.summary.totalCost.toFixed(4)}`;
+        for (const entry of Object.values(summary.byModel)) {
+            entry.cost = parseFloat(entry.cost.toFixed(6));
+        }
+        summary.events = [...events].sort((a, b) => parseInt(b.timestamp) - parseInt(a.timestamp));
+        return summary;
+    }
+    getTrackingDir() {
+        return this.trackingDir;
+    }
+}
+CostTrackingLogger.DIR_NAME = '.cursor-cost-tracking';
+CostTrackingLogger.SUMMARY_FILE = 'usage-summary.json';
+CostTrackingLogger.LOG_FILE = 'requests.log';
+CostTrackingLogger.TRACKING_STATE_FILE = 'tracking-state.json';
 class PriceItem extends vscode.TreeItem {
     constructor(label, price, collapsibleState = vscode.TreeItemCollapsibleState.None) {
         super(label, collapsibleState);
@@ -278,10 +627,14 @@ class PriceDataProvider {
         this.onDidChangeTreeData = this._onDidChangeTreeData.event;
         this.usageData = [];
         this.sessionToken = '';
+        this.costTrackingLogger = new CostTrackingLogger();
         this.loadSessionToken();
     }
     setStatusBarManager(statusBarManager) {
         this.statusBarManager = statusBarManager;
+    }
+    getCostTrackingLogger() {
+        return this.costTrackingLogger;
     }
     async loadSessionToken() {
         const config = vscode.workspace.getConfiguration('cursorPriceTracking');
@@ -312,6 +665,8 @@ class PriceDataProvider {
             }
             try {
                 this.usageData = await ApiService.fetchUsageData(this.sessionToken, 'last24h');
+                // Log usage data to workspace tracking directory
+                await this.costTrackingLogger.logUsageEvents(this.usageData);
                 // Update status bar with the first item data
                 if (this.statusBarManager) {
                     if (this.usageData.length > 0) {
@@ -320,7 +675,6 @@ class PriceDataProvider {
                         this.statusBarManager.updateUsageEvent(firstItem);
                     }
                     else {
-                        // No data found, reset loading state and show $0.00
                         this.statusBarManager.updateUsageEvent(null);
                     }
                 }
@@ -356,6 +710,7 @@ class PriceDataProvider {
             else {
                 try {
                     const usageData = await ApiService.fetchUsageData(this.sessionToken, 'last24h');
+                    await this.costTrackingLogger.logUsageEvents(usageData);
                     if (usageData.length > 0) {
                         const sortedData = usageData.sort((a, b) => parseInt(b.timestamp) - parseInt(a.timestamp));
                         const firstItem = sortedData[0];
@@ -625,9 +980,82 @@ function activate(context) {
         await priceDataProvider.clearToken();
         statusBarManager.updateCost(0);
     });
+    const openTrackingCommand = vscode.commands.registerCommand('cursorPriceTracking.openTracking', async () => {
+        const logger = priceDataProvider.getCostTrackingLogger();
+        const dir = logger.getTrackingDir();
+        if (dir && fs.existsSync(dir)) {
+            const summaryFile = path.join(dir, 'usage-summary.json');
+            if (fs.existsSync(summaryFile)) {
+                const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(summaryFile));
+                await vscode.window.showTextDocument(doc);
+            }
+            else {
+                vscode.window.showInformationMessage('No tracking data yet. Refresh usage data first.');
+            }
+        }
+        else {
+            vscode.window.showInformationMessage('No workspace open or tracking directory not created yet.');
+        }
+    });
+    const startSessionCommand = vscode.commands.registerCommand('cursorPriceTracking.startSession', async () => {
+        const logger = priceDataProvider.getCostTrackingLogger();
+        if (logger.isSessionActive()) {
+            const answer = await vscode.window.showWarningMessage('A session is already active. Stop it and start a new one?', 'Yes', 'No');
+            if (answer !== 'Yes') {
+                return;
+            }
+            logger.stopSession();
+        }
+        logger.startSession();
+        await priceDataProvider.refresh();
+    });
+    const stopSessionCommand = vscode.commands.registerCommand('cursorPriceTracking.stopSession', async () => {
+        const logger = priceDataProvider.getCostTrackingLogger();
+        if (!logger.isSessionActive()) {
+            vscode.window.showWarningMessage('No active session to stop.');
+            return;
+        }
+        await priceDataProvider.refresh();
+        const filePath = logger.stopSession();
+        if (filePath) {
+            const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
+            await vscode.window.showTextDocument(doc);
+        }
+    });
+    const rebuildTrackingCommand = vscode.commands.registerCommand('cursorPriceTracking.rebuildTracking', async () => {
+        const logger = priceDataProvider.getCostTrackingLogger();
+        const dir = logger.getTrackingDir();
+        if (!dir) {
+            vscode.window.showWarningMessage('No workspace folder open.');
+            return;
+        }
+        logger.rebuildTrackingState();
+        await priceDataProvider.refresh();
+        vscode.window.showInformationMessage('Tracking state rebuilt from requests.log');
+    });
+    const initTrackingCommand = vscode.commands.registerCommand('cursorPriceTracking.initTracking', async () => {
+        const logger = priceDataProvider.getCostTrackingLogger();
+        const dir = logger.getTrackingDir();
+        if (!dir) {
+            vscode.window.showWarningMessage('No workspace folder open. Open a folder first.');
+            return;
+        }
+        if (fs.existsSync(dir)) {
+            vscode.window.showInformationMessage(`Tracking directory already exists at ${dir}`);
+        }
+        else {
+            fs.mkdirSync(dir, { recursive: true });
+            vscode.window.showInformationMessage(`Created tracking directory: .cursor-cost-tracking/`);
+        }
+    });
     context.subscriptions.push(refreshCommand);
     context.subscriptions.push(configureCommand);
     context.subscriptions.push(resetCommand);
+    context.subscriptions.push(openTrackingCommand);
+    context.subscriptions.push(startSessionCommand);
+    context.subscriptions.push(stopSessionCommand);
+    context.subscriptions.push(rebuildTrackingCommand);
+    context.subscriptions.push(initTrackingCommand);
     context.subscriptions.push(treeView);
     // Auto-fetch data when VSCode opens - start immediately
     priceDataProvider.refresh().catch(() => {

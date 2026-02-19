@@ -1,4 +1,4 @@
-# CLAUDE.md
+git add -# CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
@@ -56,11 +56,10 @@ The extension authenticates with Cursor's API using the `WorkosCursorSessionToke
 ### VSCode Extension Integration
 
 **Commands (all registered in package.json):**
-- `cursor-price-tracking.refreshPrices` - Refresh panel data
-- `cursor-price-tracking.setToken` - Configure session token
-- `cursor-price-tracking.clearToken` - Remove stored token
-- `cursor-price-tracking.debugApi` - Test API connectivity
-- `cursor-price-tracking.refreshStatusBar` - Update status bar data
+- `cursorPriceTracking.refresh` - Refresh panel data
+- `cursorPriceTracking.configure` - Configure session token
+- `cursorPriceTracking.reset` - Remove stored token
+- `cursorPriceTracking.openTracking` - Open the `.cursor-cost-tracking` usage summary
 
 **UI Components:**
 - Tree view in custom panel container (`cursorPricePanel`)
@@ -110,6 +109,28 @@ The extension recognizes and formats various AI models:
 - Immediate data fetch on activation
 - Proper cleanup with context subscriptions
 - Error recovery with status bar feedback
+
+### Workspace Cost Tracking (`.cursor-cost-tracking/`)
+
+The extension creates a `.cursor-cost-tracking` directory in the workspace root to persist usage data locally.
+
+**CostTrackingLogger** manages two files:
+
+- **`usage-summary.json`** — A JSON snapshot updated on every refresh containing:
+  - `summary`: aggregate totals (requests, tokens, cost)
+  - `byModel`: breakdown per AI model
+  - `byKind`: breakdown per usage kind (INCLUDED_IN_PRO, USAGE, etc.)
+  - `recentEvents`: last 20 usage events
+  - `lastUpdated`: ISO timestamp of last write
+
+- **`requests.log`** — An append-only text log with one line per usage event:
+  ```
+  ts=<unix_ms> [<ISO timestamp>] Model: <model> | Tokens: <count> | Cost: <display> | Kind: <type>
+  ```
+
+**Deduplication**: The logger tracks already-logged event timestamps in memory (seeded from parsing the existing log file on first run) to avoid duplicate log entries across refreshes.
+
+**Workspace requirement**: Tracking only activates when a workspace folder is open. If no workspace is open, the logger silently no-ops.
 
 ### API Data Processing
 - Complex cost parsing from various API response formats

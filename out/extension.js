@@ -4,6 +4,136 @@ exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = require("vscode");
 const https = require("https");
+const fs = require("fs");
+const path = require("path");
+class CostTrackingLogger {
+    constructor() {
+        this.trackingDir = null;
+        this.loggedTimestamps = new Set();
+        this.initTrackingDir();
+    }
+    initTrackingDir() {
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        if (!workspaceFolder) {
+            return;
+        }
+        this.trackingDir = path.join(workspaceFolder.uri.fsPath, CostTrackingLogger.DIR_NAME);
+    }
+    ensureDirectory() {
+        if (!this.trackingDir) {
+            this.initTrackingDir();
+        }
+        if (!this.trackingDir) {
+            return false;
+        }
+        if (!fs.existsSync(this.trackingDir)) {
+            fs.mkdirSync(this.trackingDir, { recursive: true });
+        }
+        return true;
+    }
+    get summaryPath() {
+        return path.join(this.trackingDir, CostTrackingLogger.SUMMARY_FILE);
+    }
+    get logPath() {
+        return path.join(this.trackingDir, CostTrackingLogger.LOG_FILE);
+    }
+    loadExistingTimestamps() {
+        if (!this.trackingDir || !fs.existsSync(this.logPath)) {
+            return;
+        }
+        try {
+            const content = fs.readFileSync(this.logPath, 'utf-8');
+            const timestampRegex = /^ts=(\d+)/gm;
+            let match;
+            while ((match = timestampRegex.exec(content)) !== null) {
+                this.loggedTimestamps.add(match[1]);
+            }
+        }
+        catch {
+            // If the log can't be read, start fresh tracking
+        }
+    }
+    async logUsageEvents(events) {
+        if (events.length === 0) {
+            return;
+        }
+        if (!this.ensureDirectory()) {
+            return;
+        }
+        try {
+            if (this.loggedTimestamps.size === 0) {
+                this.loadExistingTimestamps();
+            }
+            this.updateSummaryFile(events);
+            this.appendToRequestLog(events);
+        }
+        catch (error) {
+            console.error('CostTrackingLogger: Failed to write tracking data', error);
+        }
+    }
+    updateSummaryFile(events) {
+        const summary = {
+            lastUpdated: new Date().toISOString(),
+            summary: { totalRequests: 0, totalTokens: 0, totalCost: 0, totalCostDisplay: '$0.00' },
+            byModel: {},
+            byKind: {},
+            recentEvents: []
+        };
+        for (const event of events) {
+            summary.summary.totalRequests++;
+            summary.summary.totalTokens += event.tokens;
+            summary.summary.totalCost += event.cost;
+            const model = event.model || 'Unknown';
+            if (!summary.byModel[model]) {
+                summary.byModel[model] = { requests: 0, tokens: 0, cost: 0 };
+            }
+            summary.byModel[model].requests++;
+            summary.byModel[model].tokens += event.tokens;
+            summary.byModel[model].cost += event.cost;
+            const kind = event.kind || 'Unknown';
+            if (!summary.byKind[kind]) {
+                summary.byKind[kind] = { requests: 0, tokens: 0, cost: 0 };
+            }
+            summary.byKind[kind].requests++;
+            summary.byKind[kind].tokens += event.tokens;
+            summary.byKind[kind].cost += event.cost;
+        }
+        summary.summary.totalCostDisplay = `$${summary.summary.totalCost.toFixed(4)}`;
+        const sorted = [...events].sort((a, b) => parseInt(b.timestamp) - parseInt(a.timestamp));
+        summary.recentEvents = sorted.slice(0, 20);
+        // Round floating point values for cleaner output
+        for (const entry of Object.values(summary.byModel)) {
+            entry.cost = parseFloat(entry.cost.toFixed(6));
+        }
+        for (const entry of Object.values(summary.byKind)) {
+            entry.cost = parseFloat(entry.cost.toFixed(6));
+        }
+        fs.writeFileSync(this.summaryPath, JSON.stringify(summary, null, 2), 'utf-8');
+    }
+    appendToRequestLog(events) {
+        const sorted = [...events].sort((a, b) => parseInt(a.timestamp) - parseInt(b.timestamp));
+        const newLines = [];
+        for (const event of sorted) {
+            if (this.loggedTimestamps.has(event.timestamp)) {
+                continue;
+            }
+            this.loggedTimestamps.add(event.timestamp);
+            const isoTime = new Date(parseInt(event.timestamp)).toISOString();
+            const line = `ts=${event.timestamp} [${isoTime}] Model: ${event.model} | Tokens: ${event.tokens.toLocaleString()} | Cost: ${event.costDisplay} | Kind: ${event.kind}`;
+            newLines.push(line);
+        }
+        if (newLines.length > 0) {
+            const payload = newLines.join('\n') + '\n';
+            fs.appendFileSync(this.logPath, payload, 'utf-8');
+        }
+    }
+    getTrackingDir() {
+        return this.trackingDir;
+    }
+}
+CostTrackingLogger.DIR_NAME = '.cursor-cost-tracking';
+CostTrackingLogger.SUMMARY_FILE = 'usage-summary.json';
+CostTrackingLogger.LOG_FILE = 'requests.log';
 class PriceItem extends vscode.TreeItem {
     constructor(label, price, collapsibleState = vscode.TreeItemCollapsibleState.None) {
         super(label, collapsibleState);
@@ -278,10 +408,14 @@ class PriceDataProvider {
         this.onDidChangeTreeData = this._onDidChangeTreeData.event;
         this.usageData = [];
         this.sessionToken = '';
+        this.costTrackingLogger = new CostTrackingLogger();
         this.loadSessionToken();
     }
     setStatusBarManager(statusBarManager) {
         this.statusBarManager = statusBarManager;
+    }
+    getCostTrackingLogger() {
+        return this.costTrackingLogger;
     }
     async loadSessionToken() {
         const config = vscode.workspace.getConfiguration('cursorPriceTracking');
@@ -312,6 +446,8 @@ class PriceDataProvider {
             }
             try {
                 this.usageData = await ApiService.fetchUsageData(this.sessionToken, 'last24h');
+                // Log usage data to workspace tracking directory
+                await this.costTrackingLogger.logUsageEvents(this.usageData);
                 // Update status bar with the first item data
                 if (this.statusBarManager) {
                     if (this.usageData.length > 0) {
@@ -320,7 +456,6 @@ class PriceDataProvider {
                         this.statusBarManager.updateUsageEvent(firstItem);
                     }
                     else {
-                        // No data found, reset loading state and show $0.00
                         this.statusBarManager.updateUsageEvent(null);
                     }
                 }
@@ -356,6 +491,7 @@ class PriceDataProvider {
             else {
                 try {
                     const usageData = await ApiService.fetchUsageData(this.sessionToken, 'last24h');
+                    await this.costTrackingLogger.logUsageEvents(usageData);
                     if (usageData.length > 0) {
                         const sortedData = usageData.sort((a, b) => parseInt(b.timestamp) - parseInt(a.timestamp));
                         const firstItem = sortedData[0];
@@ -625,9 +761,27 @@ function activate(context) {
         await priceDataProvider.clearToken();
         statusBarManager.updateCost(0);
     });
+    const openTrackingCommand = vscode.commands.registerCommand('cursorPriceTracking.openTracking', async () => {
+        const logger = priceDataProvider.getCostTrackingLogger();
+        const dir = logger.getTrackingDir();
+        if (dir && fs.existsSync(dir)) {
+            const summaryFile = path.join(dir, 'usage-summary.json');
+            if (fs.existsSync(summaryFile)) {
+                const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(summaryFile));
+                await vscode.window.showTextDocument(doc);
+            }
+            else {
+                vscode.window.showInformationMessage('No tracking data yet. Refresh usage data first.');
+            }
+        }
+        else {
+            vscode.window.showInformationMessage('No workspace open or tracking directory not created yet.');
+        }
+    });
     context.subscriptions.push(refreshCommand);
     context.subscriptions.push(configureCommand);
     context.subscriptions.push(resetCommand);
+    context.subscriptions.push(openTrackingCommand);
     context.subscriptions.push(treeView);
     // Auto-fetch data when VSCode opens - start immediately
     priceDataProvider.refresh().catch(() => {

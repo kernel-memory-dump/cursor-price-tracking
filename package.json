@@ -68,6 +68,12 @@
         "command": "cursorPriceTracking.reset",
         "title": "Reset Configuration",
         "category": "Cursor Price Tracking"
+      },
+      {
+        "command": "cursorPriceTracking.openTracking",
+        "title": "Open Cost Tracking Data",
+        "icon": "$(folder)",
+        "category": "Cursor Price Tracking"
       }
     ],
     "configuration": {

@@ -14,14 +14,30 @@ interface UsageEvent {
     kind: string;
 }
 
+interface TrackingState {
+    firstTrackedAt: string;
+    totalRequests: number;
+    totalTokens: number;
+    totalCost: number;
+    byModel: Record<string, { requests: number; tokens: number; cost: number }>;
+    byKind: Record<string, { requests: number; tokens: number; cost: number }>;
+}
+
 interface UsageSummary {
     lastUpdated: string;
-    summary: {
+    last24h: {
         totalRequests: number;
         totalTokens: number;
         totalCost: number;
         totalCostDisplay: string;
     };
+    sinceTrackingStarted: {
+        firstTrackedAt: string;
+        totalRequests: number;
+        totalTokens: number;
+        totalCost: number;
+        totalCostDisplay: string;
+    } | null;
     byModel: Record<string, { requests: number; tokens: number; cost: number }>;
     byKind: Record<string, { requests: number; tokens: number; cost: number }>;
     recentEvents: UsageEvent[];
@@ -47,11 +63,13 @@ class CostTrackingLogger {
     private static readonly DIR_NAME = '.cursor-cost-tracking';
     private static readonly SUMMARY_FILE = 'usage-summary.json';
     private static readonly LOG_FILE = 'requests.log';
+    private static readonly TRACKING_STATE_FILE = 'tracking-state.json';
 
     private trackingDir: string | null = null;
     private loggedTimestamps: Set<string> = new Set();
     private sessionStartMs: number | null = null;
     private lastKnownEvents: UsageEvent[] = [];
+    private trackingState: TrackingState | null = null;
 
     constructor() {
         this.initTrackingDir();
@@ -87,6 +105,10 @@ class CostTrackingLogger {
         return path.join(this.trackingDir!, CostTrackingLogger.LOG_FILE);
     }
 
+    private get trackingStatePath(): string {
+        return path.join(this.trackingDir!, CostTrackingLogger.TRACKING_STATE_FILE);
+    }
+
     private loadExistingTimestamps(): void {
         if (!this.trackingDir || !fs.existsSync(this.logPath)) {
             return;
@@ -103,6 +125,117 @@ class CostTrackingLogger {
         }
     }
 
+    private loadTrackingState(): void {
+        if (!this.trackingDir) { return; }
+        try {
+            if (fs.existsSync(this.trackingStatePath)) {
+                this.trackingState = JSON.parse(fs.readFileSync(this.trackingStatePath, 'utf-8'));
+            } else if (fs.existsSync(this.logPath)) {
+                this.rebuildTrackingState();
+            }
+        } catch {
+            this.trackingState = null;
+        }
+    }
+
+    private saveTrackingState(): void {
+        if (!this.trackingDir || !this.trackingState) { return; }
+        fs.writeFileSync(this.trackingStatePath, JSON.stringify(this.trackingState, null, 2), 'utf-8');
+    }
+
+    private incrementTrackingState(newEvents: UsageEvent[]): void {
+        if (newEvents.length === 0) { return; }
+
+        if (!this.trackingState) {
+            const earliest = newEvents.reduce((min, e) =>
+                parseInt(e.timestamp) < parseInt(min.timestamp) ? e : min, newEvents[0]);
+            this.trackingState = {
+                firstTrackedAt: new Date(parseInt(earliest.timestamp)).toISOString(),
+                totalRequests: 0,
+                totalTokens: 0,
+                totalCost: 0,
+                byModel: {},
+                byKind: {}
+            };
+        }
+
+        for (const event of newEvents) {
+            this.trackingState.totalRequests++;
+            this.trackingState.totalTokens += event.tokens;
+            this.trackingState.totalCost += event.cost;
+
+            const model = event.model || 'Unknown';
+            if (!this.trackingState.byModel[model]) {
+                this.trackingState.byModel[model] = { requests: 0, tokens: 0, cost: 0 };
+            }
+            this.trackingState.byModel[model].requests++;
+            this.trackingState.byModel[model].tokens += event.tokens;
+            this.trackingState.byModel[model].cost += event.cost;
+
+            const kind = event.kind || 'Unknown';
+            if (!this.trackingState.byKind[kind]) {
+                this.trackingState.byKind[kind] = { requests: 0, tokens: 0, cost: 0 };
+            }
+            this.trackingState.byKind[kind].requests++;
+            this.trackingState.byKind[kind].tokens += event.tokens;
+            this.trackingState.byKind[kind].cost += event.cost;
+        }
+
+        this.trackingState.totalCost = parseFloat(this.trackingState.totalCost.toFixed(6));
+        for (const entry of Object.values(this.trackingState.byModel)) {
+            entry.cost = parseFloat(entry.cost.toFixed(6));
+        }
+        for (const entry of Object.values(this.trackingState.byKind)) {
+            entry.cost = parseFloat(entry.cost.toFixed(6));
+        }
+
+        this.saveTrackingState();
+    }
+
+    rebuildTrackingState(): void {
+        if (!this.trackingDir || !fs.existsSync(this.logPath)) {
+            return;
+        }
+
+        const content = fs.readFileSync(this.logPath, 'utf-8');
+        const lines = content.trim().split('\n').filter(l => l.length > 0);
+        if (lines.length === 0) { return; }
+
+        const lineRegex = /^ts=(\d+) \[([^\]]+)\] Model: ([^|]+)\| Tokens: ([^|]+)\| Cost: ([^|]+)\| Kind: (.+)$/;
+
+        this.trackingState = null;
+        const parsed: UsageEvent[] = [];
+
+        for (const line of lines) {
+            const match = lineRegex.exec(line);
+            if (!match) { continue; }
+
+            const timestamp = match[1];
+            const model = match[3].trim();
+            const tokensStr = match[4].trim().replace(/,/g, '');
+            const costStr = match[5].trim().replace(/[$,]/g, '');
+            const kind = match[6].trim();
+
+            const tokens = parseInt(tokensStr) || 0;
+            const cost = parseFloat(costStr) || 0;
+
+            parsed.push({
+                timestamp,
+                date: '',
+                time: '',
+                model,
+                tokens,
+                cost,
+                costDisplay: match[5].trim(),
+                kind
+            });
+        }
+
+        if (parsed.length > 0) {
+            this.incrementTrackingState(parsed);
+        }
+    }
+
     async logUsageEvents(events: UsageEvent[]): Promise<void> {
         if (events.length === 0) {
             return;
@@ -115,8 +248,11 @@ class CostTrackingLogger {
             if (this.loggedTimestamps.size === 0) {
                 this.loadExistingTimestamps();
             }
-            this.updateSummaryFile(events);
+            if (!this.trackingState) {
+                this.loadTrackingState();
+            }
             this.appendToRequestLog(events);
+            this.updateSummaryFile(events);
         } catch (error) {
             console.error('CostTrackingLogger: Failed to write tracking data', error);
         }
@@ -125,48 +261,58 @@ class CostTrackingLogger {
     private updateSummaryFile(events: UsageEvent[]): void {
         this.lastKnownEvents = events;
 
-        const summary: UsageSummary = {
-            lastUpdated: new Date().toISOString(),
-            summary: { totalRequests: 0, totalTokens: 0, totalCost: 0, totalCostDisplay: '$0.00' },
-            byModel: {},
-            byKind: {},
-            recentEvents: [],
-            activeSession: null
-        };
+        const last24h = { totalRequests: 0, totalTokens: 0, totalCost: 0, totalCostDisplay: '$0.00' };
+        const byModel: Record<string, { requests: number; tokens: number; cost: number }> = {};
+        const byKind: Record<string, { requests: number; tokens: number; cost: number }> = {};
 
         for (const event of events) {
-            summary.summary.totalRequests++;
-            summary.summary.totalTokens += event.tokens;
-            summary.summary.totalCost += event.cost;
+            last24h.totalRequests++;
+            last24h.totalTokens += event.tokens;
+            last24h.totalCost += event.cost;
 
             const model = event.model || 'Unknown';
-            if (!summary.byModel[model]) {
-                summary.byModel[model] = { requests: 0, tokens: 0, cost: 0 };
+            if (!byModel[model]) {
+                byModel[model] = { requests: 0, tokens: 0, cost: 0 };
             }
-            summary.byModel[model].requests++;
-            summary.byModel[model].tokens += event.tokens;
-            summary.byModel[model].cost += event.cost;
+            byModel[model].requests++;
+            byModel[model].tokens += event.tokens;
+            byModel[model].cost += event.cost;
 
             const kind = event.kind || 'Unknown';
-            if (!summary.byKind[kind]) {
-                summary.byKind[kind] = { requests: 0, tokens: 0, cost: 0 };
+            if (!byKind[kind]) {
+                byKind[kind] = { requests: 0, tokens: 0, cost: 0 };
             }
-            summary.byKind[kind].requests++;
-            summary.byKind[kind].tokens += event.tokens;
-            summary.byKind[kind].cost += event.cost;
+            byKind[kind].requests++;
+            byKind[kind].tokens += event.tokens;
+            byKind[kind].cost += event.cost;
         }
 
-        summary.summary.totalCostDisplay = `$${summary.summary.totalCost.toFixed(4)}`;
+        last24h.totalCostDisplay = `$${last24h.totalCost.toFixed(4)}`;
+
+        for (const entry of Object.values(byModel)) {
+            entry.cost = parseFloat(entry.cost.toFixed(6));
+        }
+        for (const entry of Object.values(byKind)) {
+            entry.cost = parseFloat(entry.cost.toFixed(6));
+        }
 
         const sorted = [...events].sort((a, b) => parseInt(b.timestamp) - parseInt(a.timestamp));
-        summary.recentEvents = sorted.slice(0, 20);
 
-        for (const entry of Object.values(summary.byModel)) {
-            entry.cost = parseFloat(entry.cost.toFixed(6));
-        }
-        for (const entry of Object.values(summary.byKind)) {
-            entry.cost = parseFloat(entry.cost.toFixed(6));
-        }
+        const summary: UsageSummary = {
+            lastUpdated: new Date().toISOString(),
+            last24h,
+            sinceTrackingStarted: this.trackingState ? {
+                firstTrackedAt: this.trackingState.firstTrackedAt,
+                totalRequests: this.trackingState.totalRequests,
+                totalTokens: this.trackingState.totalTokens,
+                totalCost: this.trackingState.totalCost,
+                totalCostDisplay: `$${this.trackingState.totalCost.toFixed(4)}`
+            } : null,
+            byModel,
+            byKind,
+            recentEvents: sorted.slice(0, 20),
+            activeSession: null
+        };
 
         if (this.sessionStartMs) {
             const sessionEvents = events.filter(e => parseInt(e.timestamp) >= this.sessionStartMs!);
@@ -179,12 +325,14 @@ class CostTrackingLogger {
     private appendToRequestLog(events: UsageEvent[]): void {
         const sorted = [...events].sort((a, b) => parseInt(a.timestamp) - parseInt(b.timestamp));
         const newLines: string[] = [];
+        const newEvents: UsageEvent[] = [];
 
         for (const event of sorted) {
             if (this.loggedTimestamps.has(event.timestamp)) {
                 continue;
             }
             this.loggedTimestamps.add(event.timestamp);
+            newEvents.push(event);
 
             const isoTime = new Date(parseInt(event.timestamp)).toISOString();
             const line = `ts=${event.timestamp} [${isoTime}] Model: ${event.model} | Tokens: ${event.tokens.toLocaleString()} | Cost: ${event.costDisplay} | Kind: ${event.kind}`;
@@ -195,6 +343,8 @@ class CostTrackingLogger {
             const payload = newLines.join('\n') + '\n';
             fs.appendFileSync(this.logPath, payload, 'utf-8');
         }
+
+        this.incrementTrackingState(newEvents);
     }
 
     private loadSessionState(): void {
@@ -1011,6 +1161,18 @@ export function activate(context: vscode.ExtensionContext) {
         }
     });
 
+    const rebuildTrackingCommand = vscode.commands.registerCommand('cursorPriceTracking.rebuildTracking', async () => {
+        const logger = priceDataProvider.getCostTrackingLogger();
+        const dir = logger.getTrackingDir();
+        if (!dir) {
+            vscode.window.showWarningMessage('No workspace folder open.');
+            return;
+        }
+        logger.rebuildTrackingState();
+        await priceDataProvider.refresh();
+        vscode.window.showInformationMessage('Tracking state rebuilt from requests.log');
+    });
+
     const initTrackingCommand = vscode.commands.registerCommand('cursorPriceTracking.initTracking', async () => {
         const logger = priceDataProvider.getCostTrackingLogger();
         const dir = logger.getTrackingDir();
@@ -1032,6 +1194,7 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(openTrackingCommand);
     context.subscriptions.push(startSessionCommand);
     context.subscriptions.push(stopSessionCommand);
+    context.subscriptions.push(rebuildTrackingCommand);
     context.subscriptions.push(initTrackingCommand);
     context.subscriptions.push(treeView);
 

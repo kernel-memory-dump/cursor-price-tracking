@@ -88,6 +88,12 @@
         "category": "Cursor Price Tracking"
       },
       {
+        "command": "cursorPriceTracking.rebuildTracking",
+        "title": "Rebuild Tracking State from Log",
+        "icon": "$(database)",
+        "category": "Cursor Price Tracking"
+      },
+      {
         "command": "cursorPriceTracking.initTracking",
         "title": "Initialize Cost Tracking Directory",
         "icon": "$(new-folder)",

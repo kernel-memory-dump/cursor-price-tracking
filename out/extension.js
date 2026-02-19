@@ -10,7 +10,10 @@ class CostTrackingLogger {
     constructor() {
         this.trackingDir = null;
         this.loggedTimestamps = new Set();
+        this.sessionStartMs = null;
+        this.lastKnownEvents = [];
         this.initTrackingDir();
+        this.loadSessionState();
     }
     initTrackingDir() {
         const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
@@ -72,12 +75,14 @@ class CostTrackingLogger {
         }
     }
     updateSummaryFile(events) {
+        this.lastKnownEvents = events;
         const summary = {
             lastUpdated: new Date().toISOString(),
             summary: { totalRequests: 0, totalTokens: 0, totalCost: 0, totalCostDisplay: '$0.00' },
             byModel: {},
             byKind: {},
-            recentEvents: []
+            recentEvents: [],
+            activeSession: null
         };
         for (const event of events) {
             summary.summary.totalRequests++;
@@ -101,12 +106,15 @@ class CostTrackingLogger {
         summary.summary.totalCostDisplay = `$${summary.summary.totalCost.toFixed(4)}`;
         const sorted = [...events].sort((a, b) => parseInt(b.timestamp) - parseInt(a.timestamp));
         summary.recentEvents = sorted.slice(0, 20);
-        // Round floating point values for cleaner output
         for (const entry of Object.values(summary.byModel)) {
             entry.cost = parseFloat(entry.cost.toFixed(6));
         }
         for (const entry of Object.values(summary.byKind)) {
             entry.cost = parseFloat(entry.cost.toFixed(6));
+        }
+        if (this.sessionStartMs) {
+            const sessionEvents = events.filter(e => parseInt(e.timestamp) >= this.sessionStartMs);
+            summary.activeSession = this.buildSessionSummary(sessionEvents);
         }
         fs.writeFileSync(this.summaryPath, JSON.stringify(summary, null, 2), 'utf-8');
     }
@@ -126,6 +134,93 @@ class CostTrackingLogger {
             const payload = newLines.join('\n') + '\n';
             fs.appendFileSync(this.logPath, payload, 'utf-8');
         }
+    }
+    loadSessionState() {
+        if (!this.trackingDir) {
+            return;
+        }
+        try {
+            const summaryFile = path.join(this.trackingDir, CostTrackingLogger.SUMMARY_FILE);
+            if (fs.existsSync(summaryFile)) {
+                const data = JSON.parse(fs.readFileSync(summaryFile, 'utf-8'));
+                if (data.activeSession?.active) {
+                    this.sessionStartMs = data.activeSession.startedAtMs;
+                }
+            }
+        }
+        catch {
+            // corrupt file — ignore
+        }
+    }
+    startSession() {
+        this.sessionStartMs = Date.now();
+        const iso = new Date(this.sessionStartMs).toISOString();
+        if (this.ensureDirectory() && this.lastKnownEvents.length > 0) {
+            this.updateSummaryFile(this.lastKnownEvents);
+        }
+        vscode.window.showInformationMessage(`Session started at ${iso}`);
+        return iso;
+    }
+    stopSession() {
+        if (!this.sessionStartMs) {
+            vscode.window.showWarningMessage('No active session to stop.');
+            return null;
+        }
+        if (!this.ensureDirectory()) {
+            return null;
+        }
+        const sessionEvents = this.lastKnownEvents.filter(e => parseInt(e.timestamp) >= this.sessionStartMs);
+        const sessionSummary = this.buildSessionSummary(sessionEvents);
+        sessionSummary.active = false;
+        const startIso = new Date(this.sessionStartMs).toISOString();
+        const safeName = startIso.replace(/:/g, '-').replace(/\./g, '-');
+        const filename = `session-${safeName}.json`;
+        const filePath = path.join(this.trackingDir, filename);
+        fs.writeFileSync(filePath, JSON.stringify(sessionSummary, null, 2), 'utf-8');
+        this.sessionStartMs = null;
+        if (this.lastKnownEvents.length > 0) {
+            this.updateSummaryFile(this.lastKnownEvents);
+        }
+        vscode.window.showInformationMessage(`Session saved: ${filename}`);
+        return filePath;
+    }
+    isSessionActive() {
+        return this.sessionStartMs !== null;
+    }
+    buildSessionSummary(events) {
+        const now = Date.now();
+        const durationMs = now - this.sessionStartMs;
+        const minutes = Math.floor(durationMs / 60000);
+        const hours = Math.floor(minutes / 60);
+        const remainingMinutes = minutes % 60;
+        const durationStr = hours > 0 ? `${hours}h ${remainingMinutes}m` : `${remainingMinutes}m`;
+        const summary = {
+            active: true,
+            startedAt: new Date(this.sessionStartMs).toISOString(),
+            startedAtMs: this.sessionStartMs,
+            duration: durationStr,
+            summary: { totalRequests: 0, totalTokens: 0, totalCost: 0, totalCostDisplay: '$0.00' },
+            byModel: {},
+            events: []
+        };
+        for (const event of events) {
+            summary.summary.totalRequests++;
+            summary.summary.totalTokens += event.tokens;
+            summary.summary.totalCost += event.cost;
+            const model = event.model || 'Unknown';
+            if (!summary.byModel[model]) {
+                summary.byModel[model] = { requests: 0, tokens: 0, cost: 0 };
+            }
+            summary.byModel[model].requests++;
+            summary.byModel[model].tokens += event.tokens;
+            summary.byModel[model].cost += event.cost;
+        }
+        summary.summary.totalCostDisplay = `$${summary.summary.totalCost.toFixed(4)}`;
+        for (const entry of Object.values(summary.byModel)) {
+            entry.cost = parseFloat(entry.cost.toFixed(6));
+        }
+        summary.events = [...events].sort((a, b) => parseInt(b.timestamp) - parseInt(a.timestamp));
+        return summary;
     }
     getTrackingDir() {
         return this.trackingDir;
@@ -778,10 +873,53 @@ function activate(context) {
             vscode.window.showInformationMessage('No workspace open or tracking directory not created yet.');
         }
     });
+    const startSessionCommand = vscode.commands.registerCommand('cursorPriceTracking.startSession', async () => {
+        const logger = priceDataProvider.getCostTrackingLogger();
+        if (logger.isSessionActive()) {
+            const answer = await vscode.window.showWarningMessage('A session is already active. Stop it and start a new one?', 'Yes', 'No');
+            if (answer !== 'Yes') {
+                return;
+            }
+            logger.stopSession();
+        }
+        logger.startSession();
+        await priceDataProvider.refresh();
+    });
+    const stopSessionCommand = vscode.commands.registerCommand('cursorPriceTracking.stopSession', async () => {
+        const logger = priceDataProvider.getCostTrackingLogger();
+        if (!logger.isSessionActive()) {
+            vscode.window.showWarningMessage('No active session to stop.');
+            return;
+        }
+        await priceDataProvider.refresh();
+        const filePath = logger.stopSession();
+        if (filePath) {
+            const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
+            await vscode.window.showTextDocument(doc);
+        }
+    });
+    const initTrackingCommand = vscode.commands.registerCommand('cursorPriceTracking.initTracking', async () => {
+        const logger = priceDataProvider.getCostTrackingLogger();
+        const dir = logger.getTrackingDir();
+        if (!dir) {
+            vscode.window.showWarningMessage('No workspace folder open. Open a folder first.');
+            return;
+        }
+        if (fs.existsSync(dir)) {
+            vscode.window.showInformationMessage(`Tracking directory already exists at ${dir}`);
+        }
+        else {
+            fs.mkdirSync(dir, { recursive: true });
+            vscode.window.showInformationMessage(`Created tracking directory: .cursor-cost-tracking/`);
+        }
+    });
     context.subscriptions.push(refreshCommand);
     context.subscriptions.push(configureCommand);
     context.subscriptions.push(resetCommand);
     context.subscriptions.push(openTrackingCommand);
+    context.subscriptions.push(startSessionCommand);
+    context.subscriptions.push(stopSessionCommand);
+    context.subscriptions.push(initTrackingCommand);
     context.subscriptions.push(treeView);
     // Auto-fetch data when VSCode opens - start immediately
     priceDataProvider.refresh().catch(() => {
